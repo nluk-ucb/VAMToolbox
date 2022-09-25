@@ -7,6 +7,9 @@ except:
 import numpy as np
 from skimage.transform._warps import warp
 from functools import partial
+import multiprocessing as mlp
+from tqdm import tqdm
+import itertools
 
 import vamtoolbox
 
@@ -37,7 +40,7 @@ class Projector3DParallelAstra():
             astra.data3d.delete(b_id)
 
         return b
-    
+
 
     def backward(self,b):
         """Backward projector operation (x = A^Tb)"""
@@ -119,7 +122,40 @@ class Projector3DParallelPython():
         return occ_sinogram
 
 
-    def forward(self,target):
+    def _forward_R(self, angle):
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        R = np.array([[cos_a, sin_a, -self.center * (cos_a + sin_a - 1)],
+                      [-sin_a, cos_a, -self.center * (cos_a - sin_a - 1)],
+                      [0, 0, 1]])
+        return R
+
+
+    def _forward_mask(self, rotated, angle_i, z_i):
+        if self.proj_geo.attenuation_field is not None:  # mask shadow
+            curr_occ = self.occ_sinogram[:, angle_i, z_i]  # IO
+            if np.count_nonzero(curr_occ) - np.sum(np.isnan(curr_occ)) != 0:
+                occ_shadow = self.y > curr_occ[np.newaxis, :]
+
+                rotated = np.multiply(rotated, np.logical_not(occ_shadow))
+        return rotated
+
+
+    def _forward(self, target, z_i, angle_i, angle, return_tuple: bool = False):
+        rotated = warp(
+            target[:, :, z_i],
+            self._forward_R(angle),
+            clip=True
+        )  # rotate image
+        rotated = self._forward_mask(rotated, angle_i, z_i)  # mask image
+        integral = rotated.sum(0)  # return integral
+
+        if return_tuple:
+            return integral, z_i, angle_i
+        else:
+            return integral
+
+
+    def forward(self, target, n_processes: int = 1) -> np.array:
         """
         Computes forward Radon transform of the target space object accounting for
         reduced projection contribution due to occlusion shadowing
@@ -136,29 +172,59 @@ class Projector3DParallelPython():
 
         """
         projection = np.zeros((self.target_geo.nY,self.angles.shape[0],self.target_geo.nZ))
-        for z_i in range(self.target_geo.nZ):
-            for i, angle in enumerate(np.deg2rad(self.angles)):
-            
-                cos_a, sin_a = np.cos(angle), np.sin(angle)
 
-                R = np.array([[cos_a, sin_a, -self.center * (cos_a + sin_a - 1)],
-                            [-sin_a, cos_a, -self.center * (cos_a - sin_a - 1)],
-                            [0, 0, 1]])
+        z_range = range(self.target_geo.nZ)
+        angle_range = np.deg2rad(self.angles)
+        iterator = itertools.product(z_range, enumerate(angle_range))
+        pbar = tqdm(iterator, total=len(z_range) * len(angle_range), desc=f'{self.__class__.__name__} forward')
 
-                rotated = warp(target[:,:,z_i], R, clip=True)
+        if n_processes == 1:
+            for z_i, (angle_i, angle) in pbar:
+                projection[:, angle_i, z_i] = self._forward(target, z_i, angle_i, angle)
+        else:
+            pool = mlp.pool(processes=n_processes if n_processes else mlp.cpu_count())
 
-                if self.proj_geo.attenuation_field is not None:
-                    curr_occ = self.occ_sinogram[:,i,z_i]
-                    if np.count_nonzero(curr_occ) - np.sum(np.isnan(curr_occ)) != 0:
-                        
-                        occ_shadow = self.y > curr_occ[np.newaxis,:]
+            results = []
+            for z_i, (angle_i, angle) in iterator:
+                result = pool.apply_async(
+                    func=self._forward,
+                    args=(target, z_i, angle_i, angle, True),
+                    callback=pbar.update(),
+                )
+                results.append(result)
 
-                        rotated = np.multiply(rotated, np.logical_not(occ_shadow))
-            
-                projection[:, i,z_i] = rotated.sum(0)
+            pool.join()
+            pool.close()
+
+            for result in results:
+                integral, z_i, angle_i = result.get()
+                projection[:, angle_i, z_i] = integral
+
         return projection
-    
-    def backward(self,projection):
+
+
+    def _backward(self, curr_proj, z_i, angle_i, angle, return_tuple: bool = False):
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        t = self.x * cos_a - self.y * sin_a
+        s = self.x * sin_a + self.y * cos_a
+
+        curr_backproj = np.interp(x=t, xp=self.proj_t, fp=curr_proj, left=0, right=0)
+
+        if self.proj_geo.attenuation_field is not None:
+            curr_occ = self.getOccShadow(angle_i, z_i, angle, t, s)
+            if np.count_nonzero(curr_occ) - np.sum(np.isnan(curr_occ)) != 0:
+                curr_backproj += np.multiply(curr_backproj, np.logical_not(curr_occ))
+
+            # plt.imshow(np.multiply(curr_backproj,np.logical_not(curr_occ)),cmap='CMRmap')
+            # plt.show()
+
+        if return_tuple:
+            return curr_backproj, z_i, angle_i
+        else:
+            return curr_backproj
+
+
+    def backward(self,projection, n_processes: int = 1):
         """
         Computes inverse Radon transform of projection accounting for reduced dose
         deposition due to occlusion shadowing
@@ -175,40 +241,39 @@ class Projector3DParallelPython():
 
         """
 
-        reconstruction = np.zeros(self.target_geo.array.shape)
-        for z_i in range(self.target_geo.nZ):
-            reconstructed = np.zeros((reconstruction.shape[0],reconstruction.shape[1]))
-            for i, (curr_proj, angle) in enumerate(zip(projection[:,:,z_i].T, np.deg2rad(self.angles))):
-                
-                cos_a, sin_a = np.cos(angle), np.sin(angle)
+        z_range = range(self.target_geo.nZ)
+        angle_range = np.deg2rad(self.angles)
+        iterator = itertools.product(z_range, enumerate(angle_range))
+        pbar = tqdm(iterator, total=len(z_range) * len(angle_range), desc=f'{self.__class__.__name__} backward')
 
-                t = self.x * cos_a - self.y * sin_a
-                s = self.x * sin_a + self.y * cos_a
+        reconstruction = np.zeros_like(self.target_geo.array)
 
-                interpolant = partial(np.interp, xp=self.proj_t, fp=curr_proj, left=0, right=0)
-                curr_backproj = interpolant(t)
+        if n_processes == 1:
+            for z_i, (angle_i, angle) in pbar:
+                curr_proj = projection[:, angle_i, z_i]
+                reconstruction[:,:,z_i] += self._backward(curr_proj, z_i, angle_i, angle)
+        else:
+            with mlp.pool(processes=n_processes if n_processes else mlp.cpu_count()) as pool:
+                results  = []
+                for z_i, (angle_i, angle) in iterator:
+                    curr_proj = projection[:, angle_i, z_i]
+                    result = pool.apply_async(
+                        func=self._backward,
+                        args=(curr_proj, z_i, angle_i, angle, True),
+                        callback=pbar.update(),
+                    )
+                    results.append(result)
 
-                if self.proj_geo.attenuation_field is not None:
-                    curr_occ = self.getOccShadow(i,z_i,angle,t,s)
-                    if np.count_nonzero(curr_occ) - np.sum(np.isnan(curr_occ)) != 0:
-                        reconstructed += np.multiply(curr_backproj,np.logical_not(curr_occ))
-                    else:
-                        reconstructed += curr_backproj
-                else:
-                    reconstructed += curr_backproj
+                for result in results:
+                    curr_backproj, z_i, angle_i = result.get()  # TODO timeout
+                    reconstruction[:, :, z_i] += curr_backproj
 
-                # plt.imshow(np.multiply(curr_backproj,np.logical_not(curr_occ)),cmap='CMRmap')
-                # plt.show()
-            reconstruction[:,:,z_i] = reconstructed
-            
         return vamtoolbox.util.data.clipToCircle(reconstruction)
 
     def getOccShadow(self,i,j,angle,t,s):
-
         curr_occ = self.occ_sinogram[:,:,j]
-        interpolant = partial(np.interp, xp=self.proj_t, fp=curr_occ[:,i], left=np.NaN, right=np.NaN)
-        
-        return s > np.floor(interpolant(t))
+        interpolant_ = np.interp(t, xp=self.proj_t, fp=curr_occ[:,i], left=np.NaN, right=np.NaN)
+        return s > np.floor(interpolant_)
 
     # def calcVisibility(self):
     #     tmp = np.zeros((self.target_obj.nY,self.target_obj.nX,self.angles.shape[0]))

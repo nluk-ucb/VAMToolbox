@@ -4,7 +4,7 @@ import time
 # VAM toolbox imports
 import vamtoolbox
 
-def minimizeOSMO(target_geo,proj_geo,options):
+def minimizeOSMO(target_geo,proj_geo,options, **kwargs):
 
     """
     Sinogram optimization via object-space model optimization (OSMO). 
@@ -125,9 +125,10 @@ def minimizeOSMO(target_geo,proj_geo,options):
     x_model = np.real(target_filtered)
 
     # the initial sinogram is just the forward projection of the model
-    b = A.forward(x_model)
+    n_processes = kwargs.get('n_processes', 1)
+    b = A.forward(x_model, n_processes=n_processes)
     b = np.clip(b,0,None)
-    x = A.backward(b)
+    x = A.backward(b, n_processes=n_processes)
     x = x/np.amax(x)
 
     _error[0] = vamtoolbox.metrics.calcVER(target_geo,x)

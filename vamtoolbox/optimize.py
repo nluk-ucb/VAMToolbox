@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+from typing import Optional
 
 import vamtoolbox
 
@@ -10,7 +11,16 @@ class Options:
     __default_PM = {"rho_1":1,"rho_2":1,"p":1}
     __default_OSMO = {"inhibition":0}
 
-    def __init__(self,method : str ='CAL',n_iter : int = 50,d_h : float = 0.8,d_l : float = 0.7,filter : str ='ram-lak',units:str='normalized',**kwargs):
+    def __init__(
+        self,
+        method: str = 'CAL',
+        n_iter: int = 50,
+        d_h: float = 0.8,
+        d_l: float = 0.7,
+        filter: str = 'ram-lak',
+        units: str = 'normalized',
+        **kwargs
+    ):
         """
         Parameters
         ----------
@@ -94,7 +104,12 @@ class Options:
 
 
 
-def optimize(target_geo : vamtoolbox.geometry.TargetGeometry,proj_geo : vamtoolbox.geometry.ProjectionGeometry,options:Options):
+def optimize(
+    target_geo: vamtoolbox.geometry.TargetGeometry,
+    proj_geo: vamtoolbox.geometry.ProjectionGeometry,
+    options: Options,
+    **kwargs
+):
     """
     Performs VAM optimization using the selected optimizer in options
 
@@ -127,7 +142,7 @@ def optimize(target_geo : vamtoolbox.geometry.TargetGeometry,proj_geo : vamtoolb
         return vamtoolbox.optimizer.PM.minimizePM(target_geo,proj_geo,options)
 
     elif options.method == "OSMO":
-        return vamtoolbox.optimizer.OSMO.minimizeOSMO(target_geo,proj_geo,options)
+        return vamtoolbox.optimizer.OSMO.minimizeOSMO(target_geo,proj_geo,options, **kwargs)
 
 
         
